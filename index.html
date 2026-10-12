@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 背面點名系統 - 點名辨識中心</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<style>
+  body{font-family:Arial,"Microsoft JhengHei",sans-serif;margin:20px;background:#f4f4f9;color:#333}
+  h2{color:#4a4a4a}
+  .box{background:#fff;padding:15px;border-radius:8px;margin-bottom:15px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+  .container{display:flex;gap:20px;flex-wrap:wrap}
+  .canvas-container{border:2px solid #333;background:#fff;max-width:800px;width:100%}
+  canvas{display:block;width:100%;cursor:pointer}
+  .panel{flex:1;min-width:320px;background:#fff;padding:15px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,.1)}
+  button{padding:9px 14px;font-size:14px;color:#fff;border:none;border-radius:4px;cursor:pointer;margin:6px 6px 0 0}
+  button:disabled{background:#ccc!important;cursor:not-allowed}
+  table{width:100%;border-collapse:collapse;margin-top:12px}
+  th,td{border:1px solid #ddd;padding:7px;text-align:center}
+  th{background:#f2f2f2}
+  #report-table tbody tr{cursor:pointer}
+  .ok{color:green;font-weight:bold}.no{color:red;font-weight:bold}
+  #loading-msg{color:#ff9800;font-weight:bold;margin-bottom:10px}
+  input[type=text],input[type=date],input[type=password]{padding:5px}
+  .row{margin-top:10px}
+  small.hint{color:#888}
+  #line-status{margin-top:8px;font-size:13px}
+</style>
+</head>
+<body>
+<h2>AI 影像點名與結果視覺化 🚀</h2>
+
+<div class="box">
+  <label><b>1. 匯入座位設定 (JSON)：</b></label> <input type="file" id="upload-json" accept=".json"><br>
+  <small class="hint">匯入時會依「目前選擇的班級」記住這份座位表，之後切換班級或 LINE 自動模式會自動套用。</small><br><br>
+  <label><b>2. 上傳今天上課背面照片：</b></label> <input type="file" id="upload-img" accept="image/*" disabled> <b>或</b>
+  <button id="open-cam" disabled style="background:#6f42c1">📷 使用 Webcam 拍照</button>
+  <div id="cam-box" style="display:none;margin-top:12px">
+    相機：<select id="cam-select"></select><br>
+    <video id="cam-video" autoplay playsinline muted style="max-width:640px;width:100%;background:#000;border-radius:6px;margin-top:8px"></video><br>
+    <button id="cam-shot" style="background:#dc3545">📸 拍照並自動點名</button>
+    <button id="cam-close" style="background:#6c757d">關閉相機</button>
+    <span id="cam-msg" style="color:red;font-size:13px"></span>
+  </div>
+</div>
+
+<div class="box">
+  <b>🤖 LINE 自動點名模式</b>
+  <div class="row">Apps Script 網址：<input type="text" id="gs-url" placeholder="https://script.google.com/macros/s/.../exec" style="width:80%"></div>
+  <div class="row">API 密碼（同 Code.gs 的 API_KEY）：<input type="password" id="api-key" style="width:240px"></div>
+  <div class="row">
+    <button id="line-auto" style="background:#06c755">▶ 開始 LINE 自動模式</button>
+    <small class="hint">開啟後請保持此頁面開著；每 6 秒檢查一次是否有人在 LINE 傳照片。</small>
+  </div>
+  <div id="line-status"></div>
+</div>
+
+<div id="loading-msg">⏳ AI 模型載入中，請稍候...</div>
+
+<div class="container">
+  <div class="canvas-container"><canvas id="result-canvas" width="400" height="300"></canvas></div>
+
+  <div class="panel">
+    <h3>點名統計報表</h3>
+    <div>AI 偵測人數：<span id="det-count">0</span>　出席：<span id="present-count" class="ok">0</span> / <span id="total-count">0</span></div>
+
+    <div class="row">偵測靈敏度（越低越容易抓到人，也越容易誤判）：
+      <input type="range" id="thr" min="0.15" max="0.7" step="0.05" value="0.3"> <span id="thr-val">0.30</span>
+    </div>
+    <small class="hint">點擊畫面上的座位或表格列，可手動切換出席/缺席來修正。</small>
+
+    <div class="row">課程/班級：<select id="class-name" style="padding:5px">
+        <option value="">-- 請選擇班級 --</option>
+        <option>資料一真</option><option>資料一善</option>
+        <option>資料三真</option><option>資料三善</option>
+      </select>
+      　點名日期：<input type="date" id="roll-date"></div>
+
+    <div>
+      <button id="save-db" style="background:#007bff" disabled>💾 存入資料庫</button>
+      <button id="save-gs" style="background:#0f9d58" disabled>📊 上傳到 Google Sheet</button>
+      <label style="font-size:13px;margin-left:6px">
+        <input type="checkbox" id="line-notify" checked> 同時傳送 LINE 通知
+      </label>
+      <button id="download-csv" style="background:#28a745" disabled>匯出本次 CSV</button>
+    </div>
+    <div id="save-msg" style="margin-top:8px;font-size:13px"></div>
+
+    <table id="report-table">
+      <thead><tr><th>座位名稱/學號</th><th>出席狀態</th></tr></thead>
+      <tbody><tr><td colspan="2" style="color:#999">暫無資料，請先完成上方步驟</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="box" id="history-box" style="margin-top:20px">
+  <h3>📚 歷史點名紀錄（瀏覽器資料庫）<small id="db-mode" style="color:#888;font-weight:normal"></small></h3>
+  <button id="export-all" style="background:#6c757d">匯出全部歷史 (CSV)</button>
+  <button id="clear-db" style="background:#dc3545">清空資料庫</button>
+  <table id="history-table">
+    <thead><tr><th>日期</th><th>班級</th><th>出席/總數</th><th>缺席名單</th><th>刪除</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const canvas = $('result-canvas'), ctx = canvas.getContext('2d');
+const loadingMsg = $('loading-msg'), imgInput = $('upload-img');
+const saveDbBtn = $('save-db'), saveGsBtn = $('save-gs'), csvBtn = $('download-csv');
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const lsGetItem = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const lsSetItem = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+
+let cocoModel = null, seatsData = [], img = new Image();
+let rawPeople = [];      // 全部偵測結果（正規化座標 0~1，含分數）
+let lastPeople = [];     // 通過靈敏度門檻的人
+$('roll-date').value = new Date().toISOString().slice(0, 10);
+$('class-name').value = lsGetItem('lastClass') || '';
+
+/* ---------- 1. 載入 AI 模型（較準的 mobilenet_v2） ---------- */
+const modelReady = (async () => {
+  try {
+    if (typeof cocoSsd === 'undefined') throw new Error('cocoSsd 未載入（請確認可連線 cdn.jsdelivr.net）');
+    await tf.ready();
+    cocoModel = await cocoSsd.load({ base: 'mobilenet_v2' });
+    loadingMsg.style.display = 'none';
+  } catch (err) {
+    loadingMsg.innerText = '❌ AI 模型載入失敗：' + err.message;
+    throw err;
+  }
+})();
+modelReady.catch(() => {});
+
+/* ---------- 2. 座位 JSON ---------- */
+function applySeats(raw) {
+  let d = raw;
+  if (!Array.isArray(d) && d && Array.isArray(d.seats)) d = d.seats;
+  if (!Array.isArray(d) || !d.length) throw new Error('內容不是座位陣列');
+  seatsData = d.map(s => ({ ...s, present: false }));
+  imgInput.disabled = false; $('open-cam').disabled = false;
+  updateTable();
+  return d;
+}
+function seatsFor(cls) {
+  for (const k of ['seats_' + cls, 'seats_default']) {
+    const v = lsGetItem(k);
+    if (v) { try { return JSON.parse(v); } catch (e) {} }
+  }
+  return null;
+}
+$('class-name').addEventListener('change', () => {
+  const cls = $('class-name').value;
+  lsSetItem('lastClass', cls);
+  const saved = cls && lsGetItem('seats_' + cls);
+  if (saved) { try { applySeats(JSON.parse(saved)); msg('已套用「' + cls + '」先前儲存的座位表', '#555'); } catch (e) {} }
+});
+$('upload-json').addEventListener('change', e => {
+  const file = e.target.files[0]; if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try {
+      const d = applySeats(JSON.parse(ev.target.result));
+      const cls = $('class-name').value;
+      lsSetItem('seats_default', JSON.stringify(d));
+      if (cls) lsSetItem('seats_' + cls, JSON.stringify(d));
+
+      const idCount = {};
+      seatsData.forEach(s => { idCount[s.id] = (idCount[s.id] || 0) + 1; });
+      const dups = Object.keys(idCount).filter(id => idCount[id] > 1);
+      if (dups.length) alert(`⚠️ 匯入成功，但座位名稱有重複：${dups.join('、')}\n\n重複的名稱在缺席名單裡無法分辨，建議回標定工具修正。`);
+      else alert(`成功匯入 ${seatsData.length} 個座位設定！` + (cls ? `（已記住為「${cls}」的座位表）` : '（尚未選班級，已存為預設座位表）'));
+    } catch (err) { alert('JSON 讀取失敗：' + err.message); }
+  };
+  reader.readAsText(file);
+});
+
+/* ---------- 3. 影像載入與分析 ---------- */
+imgInput.addEventListener('change', e => {
+  const file = e.target.files[0]; if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => manualAnalyze(ev.target.result);
+  reader.readAsDataURL(file);
+});
+
+function loadImg(src) {
+  return new Promise((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = () => rej(new Error('圖片載入失敗'));
+    i.src = src;
+  });
+}
+async function manualAnalyze(src) {
+  try { await analyze(src); } catch (err) { alert('辨識失敗：' + err.message); loadingMsg.style.display = 'none'; }
+}
+
+function iou(a, b) {
+  const ix = Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1));
+  const iy = Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
+  const inter = ix * iy;
+  const aa = (a.x2 - a.x1) * (a.y2 - a.y1), bb = (b.x2 - b.x1) * (b.y2 - b.y1);
+  return { iou: inter / (aa + bb - inter || 1), minCover: inter / (Math.min(aa, bb) || 1) };
+}
+function nms(list) {
+  list.sort((a, b) => b.score - a.score);
+  const keep = [];
+  for (const p of list) {
+    if (!keep.some(k => { const r = iou(k, p); return r.iou > 0.45 || r.minCover > 0.8; })) keep.push(p);
+  }
+  return keep;
+}
+
+/* 分塊偵測：整張 + 4 個重疊區塊，解決後排人太小抓不到的問題 */
+async function detectPeople(src) {
+  const longSide = Math.max(src.width, src.height), k = Math.min(1, 1600 / longSide);
+  const W = Math.round(src.width * k), H = Math.round(src.height * k);
+  const work = document.createElement('canvas'); work.width = W; work.height = H;
+  work.getContext('2d').drawImage(src, 0, 0, W, H);
+
+  const found = [];
+  const run = async (sx, sy, sw, sh) => {
+    const c = document.createElement('canvas'); c.width = Math.round(sw); c.height = Math.round(sh);
+    c.getContext('2d').drawImage(work, sx, sy, sw, sh, 0, 0, c.width, c.height);
+    const preds = await cocoModel.detect(c, 50, 0.15);
+    preds.filter(p => p.class === 'person').forEach(p => {
+      found.push({
+        score: p.score,
+        x1: (sx + p.bbox[0]) / W, y1: (sy + p.bbox[1]) / H,
+        x2: (sx + p.bbox[0] + p.bbox[2]) / W, y2: (sy + p.bbox[1] + p.bbox[3]) / H
+      });
+    });
+    await tf.nextFrame();
+  };
+  await run(0, 0, W, H);
+  for (const fx of [0, 0.4]) for (const fy of [0, 0.4]) await run(W * fx, H * fy, W * 0.6, H * 0.6);
+  return nms(found);
+}
+
+async function analyze(src) {
+  await modelReady;
+  img = await loadImg(src);
+  const scale = 800 / img.width;
+  canvas.width = 800; canvas.height = Math.round(img.height * scale);
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  loadingMsg.innerText = '🔍 AI 正在辨識人體中（分塊偵測，約需數秒）...'; loadingMsg.style.display = 'block';
+  try { rawPeople = await detectPeople(img); }
+  finally { loadingMsg.style.display = 'none'; }
+  applyThreshold();
+}
+
+function applyThreshold() {
+  const t = parseFloat($('thr').value);
+  $('thr-val').innerText = t.toFixed(2);
+  lastPeople = rawPeople.filter(p => p.score >= t);
+  runCheckIn(lastPeople);
+}
+$('thr').addEventListener('input', () => { if (rawPeople.length || img.src) applyThreshold(); });
+
+/* ---------- 3b. Webcam ---------- */
+let camStream = null;
+function stopCam() {
+  if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+  $('cam-video').srcObject = null;
+}
+async function startCam(deviceId) {
+  stopCam(); $('cam-msg').innerText = '';
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { $('cam-msg').innerText = '❌ 此瀏覽器不支援相機功能'; return; }
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: deviceId ? { deviceId: { exact: deviceId } } : { width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false
+    });
+    $('cam-video').srcObject = camStream;
+    const cur = camStream.getVideoTracks()[0].getSettings().deviceId;
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+    $('cam-select').innerHTML = devs.map((d, i) =>
+      `<option value="${esc(d.deviceId)}" ${d.deviceId === cur ? 'selected' : ''}>${esc(d.label || '相機 ' + (i + 1))}</option>`).join('');
+  } catch (err) {
+    $('cam-msg').innerText = '❌ 無法開啟相機（' + err.name + '）：請確認已允許相機權限，且沒有被其他程式佔用。';
+  }
+}
+$('open-cam').addEventListener('click', () => { $('cam-box').style.display = 'block'; startCam(); });
+$('cam-select').addEventListener('change', e => startCam(e.target.value));
+$('cam-close').addEventListener('click', () => { stopCam(); $('cam-box').style.display = 'none'; });
+$('cam-shot').addEventListener('click', () => {
+  const v = $('cam-video');
+  if (!camStream || !v.videoWidth) return alert('相機畫面尚未就緒，請稍候再試');
+  const c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0);
+  const data = c.toDataURL('image/jpeg', 0.92);
+  stopCam(); $('cam-box').style.display = 'none';
+  canvas.scrollIntoView({ behavior: 'smooth' });
+  manualAnalyze(data);
+});
+
+/* ---------- 4. 比對座位（一人一座、一座一人，全域最佳配對） ---------- */
+function runCheckIn(people) {
+  seatsData.forEach(s => s.present = false);
+  const pairs = [];
+  people.forEach((p, pi) => {
+    const w = p.x2 - p.x1, h = p.y2 - p.y1;
+    // 背面照：以身體上半部（頭肩）作為代表點，比整體中心更準
+    const px = (p.x1 + p.x2) / 2, py = p.y1 + h * 0.35;
+    seatsData.forEach((s, si) => {
+      const ix = Math.max(0, Math.min(p.x2, s.x_max) - Math.max(p.x1, s.x_min));
+      const iy = Math.max(0, Math.min(p.y2, s.y_max) - Math.max(p.y1, s.y_min));
+      const area = (s.x_max - s.x_min) * (s.y_max - s.y_min);
+      const pArea = w * h;
+      let score = area > 0 ? (ix * iy) / Math.min(area, pArea || area) * 0.6 : 0;
+      if (px >= s.x_min && px <= s.x_max && py >= s.y_min && py <= s.y_max) score += 1;
+      else {
+        // 代表點落在座位外：依距離扣分，離座位中心越近越可能是同一人
+        const cx = (s.x_min + s.x_max) / 2, cy = (s.y_min + s.y_max) / 2;
+        const d = Math.hypot((px - cx) / Math.max(s.x_max - s.x_min, .01), (py - cy) / Math.max(s.y_max - s.y_min, .01));
+        score += Math.max(0, 0.4 - d * 0.15);
+      }
+      if (score >= 0.25) pairs.push({ pi, si, score: score * (0.7 + 0.3 * p.score) });
+    });
+  });
+  pairs.sort((a, b) => b.score - a.score);
+  const usedP = new Set(), usedS = new Set();
+  for (const pr of pairs) {
+    if (usedP.has(pr.pi) || usedS.has(pr.si)) continue;
+    usedP.add(pr.pi); usedS.add(pr.si);
+    seatsData[pr.si].present = true;
+  }
+  drawVisualization(); updateTable();
+  saveDbBtn.disabled = saveGsBtn.disabled = csvBtn.disabled = false;
+}
+
+function drawVisualization() {
+  if (!img.src) return;
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  ctx.save(); ctx.setLineDash([6, 4]); ctx.strokeStyle = '#007bff'; ctx.lineWidth = 2;
+  lastPeople.forEach(p => ctx.strokeRect(p.x1 * canvas.width, p.y1 * canvas.height, (p.x2 - p.x1) * canvas.width, (p.y2 - p.y1) * canvas.height));
+  ctx.restore();
+  seatsData.forEach(s => {
+    const x = s.x_min * canvas.width, y = s.y_min * canvas.height;
+    const w = (s.x_max - s.x_min) * canvas.width, h = (s.y_max - s.y_min) * canvas.height;
+    ctx.strokeStyle = s.present ? '#28a745' : '#dc3545';
+    ctx.fillStyle = s.present ? 'rgba(40,167,69,.2)' : 'rgba(220,53,69,.2)';
+    ctx.lineWidth = 3; ctx.fillRect(x, y, w, h); ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = '#fff'; ctx.shadowColor = '#000'; ctx.shadowBlur = 4;
+    ctx.font = 'bold 14px Arial'; ctx.fillText(s.id, x + 5, y + 18); ctx.shadowBlur = 0;
+  });
+}
+
+function updateTable() {
+  const tb = document.querySelector('#report-table tbody');
+  tb.innerHTML = '';
+  $('total-count').innerText = seatsData.length;
+  $('det-count').innerText = lastPeople.length;
+  let n = 0;
+  seatsData.forEach((s, i) => {
+    if (s.present) n++;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><b>${esc(s.id)}</b></td><td class="${s.present ? 'ok' : 'no'}">${s.present ? '出席' : '缺席'}</td>`;
+    tr.onclick = () => toggleSeat(i);
+    tb.appendChild(tr);
+  });
+  if (!seatsData.length) tb.innerHTML = '<tr><td colspan="2" style="color:#999">暫無資料</td></tr>';
+  $('present-count').innerText = n;
+}
+function toggleSeat(i) { seatsData[i].present = !seatsData[i].present; drawVisualization(); updateTable(); }
+canvas.addEventListener('click', e => {
+  if (!img.src || !seatsData.length) return;
+  const r = canvas.getBoundingClientRect();
+  const nx = (e.clientX - r.left) / r.width, ny = (e.clientY - r.top) / r.height;
+  const i = seatsData.findIndex(s => nx >= s.x_min && nx <= s.x_max && ny >= s.y_min && ny <= s.y_max);
+  if (i >= 0) toggleSeat(i);
+});
+
+/* ---------- 共用：本次紀錄 ---------- */
+function buildRecord(cls) {
+  const absent = seatsData.filter(s => !s.present).map(s => String(s.id));
+  const present = seatsData.filter(s => s.present).map(s => String(s.id));
+  return { date: $('roll-date').value || new Date().toISOString().slice(0, 10),
+           className: (cls || $('class-name').value).trim() || '(未填)', total: seatsData.length, present, absent };
+}
+function msg(t, color) { $('save-msg').style.color = color || '#333'; $('save-msg').innerText = t; }
+
+/* ---------- 5. 瀏覽器資料庫 ---------- */
+let db = null, useLS = false;
+const LS_KEY = 'attendanceRecords';
+const lsGet = () => { try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch (e) { return []; } };
+const lsSet = a => localStorage.setItem(LS_KEY, JSON.stringify(a));
+
+function initDB() {
+  return new Promise(resolve => {
+    try {
+      const req = indexedDB.open('AttendanceDB_v2', 1);
+      req.onupgradeneeded = e => {
+        const d = e.target.result;
+        if (!d.objectStoreNames.contains('attendance')) d.createObjectStore('attendance', { keyPath: 'id', autoIncrement: true });
+      };
+      req.onsuccess = e => { db = e.target.result; try { db.transaction('attendance'); } catch (err) { useLS = true; } resolve(); };
+      req.onerror = req.onblocked = () => { useLS = true; resolve(); };
+    } catch (err) { useLS = true; resolve(); }
+  });
+}
+function idbRun(mode, fn) {
+  return new Promise((res, rej) => {
+    try {
+      const tx = db.transaction('attendance', mode);
+      const req = fn(tx.objectStore('attendance'));
+      tx.oncomplete = () => res(req && req.result);
+      tx.onerror = tx.onabort = () => rej(tx.error);
+    } catch (e) { rej(e); }
+  });
+}
+async function dbAll() { return useLS ? lsGet() : idbRun('readonly', st => st.getAll()); }
+async function dbAdd(r) {
+  if (useLS) { const a = lsGet(); r.id = Date.now(); a.push(r); lsSet(a); return; }
+  await idbRun('readwrite', st => st.add(r));
+}
+async function dbDel(id) { if (useLS) { lsSet(lsGet().filter(x => x.id !== id)); return; } await idbRun('readwrite', st => st.delete(id)); }
+async function dbClear() { if (useLS) { lsSet([]); return; } await idbRun('readwrite', st => st.clear()); }
+
+saveDbBtn.addEventListener('click', async () => {
+  const r = buildRecord();
+  if (!$('roll-date').value) return alert('請選擇點名日期');
+  if (!$('class-name').value) return alert('請先選擇課程/班級');
+  try {
+    await dbAdd(r);
+    msg(`✅ 已存入資料庫，缺席 ${r.absent.length} 人：${r.absent.join('、') || '無'}`, 'green');
+    await loadHistory();
+    $('history-box').scrollIntoView({ behavior: 'smooth' });
+  } catch (err) { msg('❌ 存入失敗：' + (err && err.message || err), 'red'); }
+});
+
+async function loadHistory() {
+  const tb = document.querySelector('#history-table tbody');
+  let rows = [];
+  try { rows = (await dbAll()).reverse(); }
+  catch (err) { tb.innerHTML = `<tr><td colspan="5" class="no">讀取失敗：${esc(err && err.message || err)}</td></tr>`; return; }
+  $('db-mode').innerText = useLS ? '（儲存方式：localStorage）' : '（儲存方式：IndexedDB）';
+  tb.innerHTML = rows.length ? '' : '<tr><td colspan="5" style="color:#999">尚無紀錄</td></tr>';
+  rows.forEach(r => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${esc(r.date)}</td><td>${esc(r.className)}</td><td>${r.present.length}/${r.total}</td>
+      <td class="no">${esc(r.absent.join('、') || '全勤')}</td>
+      <td><span style="cursor:pointer;color:red">❌</span></td>`;
+    tr.querySelector('span').onclick = async () => { await dbDel(r.id); loadHistory(); };
+    tb.appendChild(tr);
+  });
+}
+$('clear-db').addEventListener('click', async () => {
+  if (!confirm('確定清空所有歷史紀錄？')) return;
+  await dbClear(); loadHistory();
+});
+initDB().then(loadHistory);
+
+/* ---------- 6. CSV ---------- */
+function downloadCSV(text, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob(['\uFEFF' + text], { type: 'text/csv;charset=utf-8;' }));
+  a.download = name; document.body.appendChild(a); a.click(); a.remove();
+}
+csvBtn.addEventListener('click', () => {
+  const r = buildRecord();
+  let c = '座位/學號,出席狀態\n';
+  seatsData.forEach(s => c += `"${s.id}","${s.present ? '出席' : '缺席'}"\n`);
+  downloadCSV(c, `點名紀錄_${r.date || 'today'}.csv`);
+});
+$('export-all').addEventListener('click', async () => {
+  const rows = await dbAll();
+  let c = '日期,班級,總人數,出席人數,缺席人數,缺席名單\n';
+  rows.forEach(r => c += `"${r.date}","${r.className}",${r.total},${r.present.length},${r.absent.length},"${r.absent.join('、')}"\n`);
+  downloadCSV(c, '缺席歷史紀錄.csv');
+});
+
+/* ---------- 7. Google Sheet / Apps Script ---------- */
+$('gs-url').value = lsGetItem('gsUrl') || '';
+$('api-key').value = lsGetItem('apiKey') || '';
+$('line-notify').checked = lsGetItem('lineNotify') !== '0';
+$('line-notify').addEventListener('change', () => lsSetItem('lineNotify', $('line-notify').checked ? '1' : '0'));
+$('gs-url').addEventListener('change', () => lsSetItem('gsUrl', $('gs-url').value.trim()));
+$('api-key').addEventListener('change', () => lsSetItem('apiKey', $('api-key').value));
+const GS_RE = /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec/;
+
+saveGsBtn.addEventListener('click', async () => {
+  const url = $('gs-url').value.trim();
+  if (!GS_RE.test(url)) return alert('請貼上正確的 Apps Script 網址（結尾為 /exec）');
+  if (!$('roll-date').value) return alert('請選擇點名日期');
+  if (!$('class-name').value) return alert('請先選擇課程/班級');
+  const r = buildRecord();
+  const payload = { key: $('api-key').value, action: 'upload', datetime: r.date, className: r.className, total: r.total,
+                    presentCount: r.present.length, absent: r.absent, sendLine: $('line-notify').checked };
+  saveGsBtn.disabled = true; msg('⏳ 上傳中...');
+  try {
+    const res = await fetch(url, { method: 'POST', body: JSON.stringify(payload) });
+    const j = await res.json();
+    if (j.ok) {
+      let t = `✅ 已寫入 Google Sheet（${j.added} 筆）`;
+      if (payload.sendLine) t += j.lineSent ? '，LINE 通知已送出' : `，但 LINE 通知失敗：${j.lineError || '未知錯誤'}`;
+      msg(t, j.lineSent === false ? '#e67e00' : 'green');
+    } else msg('❌ 伺服器錯誤：' + j.error, 'red');
+  } catch (err) {
+    try { await fetch(url, { method: 'POST', mode: 'no-cors', body: JSON.stringify(payload) }); msg('已送出，但無法確認回應，請到試算表檢查。', '#e67e00'); }
+    catch (e2) { msg('❌ 上傳失敗：' + e2, 'red'); }
+  }
+  saveGsBtn.disabled = false;
+});
+
+/* ---------- 8. LINE 自動模式（輪詢 Apps Script） ---------- */
+let autoOn = false, autoBusy = false, autoTimer = null, wakeLock = null;
+const lineStatus = (t, c) => { $('line-status').style.color = c || '#333'; $('line-status').innerText = t; };
+
+async function postResult(url, payload) {
+  const res = await fetch(url, { method: 'POST', body: JSON.stringify(payload) });
+  return res.json();
+}
+
+async function pollOnce() {
+  if (autoBusy || !autoOn) return;
+  const url = $('gs-url').value.trim(), key = $('api-key').value;
+  autoBusy = true;
+  try {
+    const res = await fetch(`${url}?action=pending&key=${encodeURIComponent(key)}`);
+    const j = await res.json();
+    if (!j.ok) { lineStatus('❌ ' + j.error, 'red'); return; }
+    if (!j.item) { lineStatus('🟢 等待 LINE 照片中…（' + new Date().toLocaleTimeString() + '）', '#06a'); return; }
+
+    const it = j.item;
+    const cls = it.className || $('class-name').value;
+    lineStatus('📷 收到照片，辨識中…' + (cls ? '（' + cls + '）' : ''), '#e67e00');
+    if (cls && [...$('class-name').options].some(o => o.value === cls)) $('class-name').value = cls;
+
+    const raw = seatsFor(cls);
+    if (!raw) {
+      await postResult(url, { key, action: 'result', id: it.id, error: '網頁尚未設定「' + (cls || '預設') + '」的座位表' });
+      lineStatus('❌ 沒有座位表可用，已通知 LINE', 'red'); return;
+    }
+    try {
+      applySeats(raw);
+      await analyze(`data:${it.mime};base64,${it.imageBase64}`);
+      const r = buildRecord(cls);
+      await dbAdd({ ...r }); loadHistory();
+      const out = await postResult(url, { key, action: 'result', id: it.id, date: r.date, className: r.className,
+                                          total: r.total, presentCount: r.present.length, absent: r.absent });
+      lineStatus(out.ok ? `✅ 已回報 LINE：缺席 ${r.absent.length} 人` + (out.lineSent ? '' : '（LINE 推播失敗：' + (out.lineError || '') + '）') : '❌ ' + out.error,
+                 out.ok && out.lineSent ? 'green' : '#e67e00');
+    } catch (err) {
+      try { await postResult(url, { key, action: 'result', id: it.id, error: String(err.message || err) }); } catch (e) {}
+      lineStatus('❌ 辨識失敗：' + (err.message || err), 'red');
+    }
+  } catch (err) {
+    lineStatus('❌ 連線失敗：' + (err.message || err), 'red');
+  } finally { autoBusy = false; }
+}
+
+$('line-auto').addEventListener('click', async () => {
+  const btn = $('line-auto');
+  if (autoOn) {
+    autoOn = false; clearInterval(autoTimer);
+    if (wakeLock) { try { wakeLock.release(); } catch (e) {} wakeLock = null; }
+    btn.innerText = '▶ 開始 LINE 自動模式'; btn.style.background = '#06c755'; lineStatus('已停止'); return;
+  }
+  if (!GS_RE.test($('gs-url').value.trim())) return alert('請先填入正確的 Apps Script 網址');
+  if (!$('api-key').value) return alert('請填入 API 密碼');
+  lsSetItem('gsUrl', $('gs-url').value.trim()); lsSetItem('apiKey', $('api-key').value);
+  autoOn = true;
+  btn.innerText = '⏹ 停止 LINE 自動模式'; btn.style.background = '#6c757d';
+  try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  lineStatus('⏳ 啟動中…（先載入 AI 模型）');
+  modelReady.then(() => { if (autoOn) { pollOnce(); autoTimer = setInterval(pollOnce, 6000); } })
+            .catch(() => lineStatus('❌ AI 模型載入失敗，無法自動辨識', 'red'));
+});
+</script>
+</body>
+</html>
